@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -1578,4 +1578,272 @@ def diff_export(req: DiffRequest):
         content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="srt_diff.csv"'},
+    )
+
+
+# ---------------------------------------------------------------- 目标词时间标记
+
+WORD_CROSS_GAP_MS = 500  # 仅相邻字幕间隔不超过 500ms 时允许跨块命中
+
+
+class WordMarkRequest(BaseModel):
+    srt: str
+    words: str          # 逐行目标词（每行一个，行内空白忽略）
+    pre_ms: float = 0   # 向前扩展毫秒（非负）
+    post_ms: float = 0  # 向后扩展毫秒（非负）
+
+
+def _strip_ws(s: str) -> str:
+    """去除全部空白字符（Unicode 空白，含换行 / 制表符 / 全角空格）。"""
+    return "".join(ch for ch in s if not ch.isspace())
+
+
+def _parse_target_words(text: str) -> List[tuple]:
+    """逐行读取目标词：行内空白去除，空行跳过。返回 [(输入行号, 去空白词)]。"""
+    out = []
+    for i, line in enumerate(text.replace("\r\n", "\n").replace("\r", "\n").split("\n"), 1):
+        word = _strip_ws(line)
+        if word:
+            out.append((i, word))
+    if not out:
+        raise ValueError("请至少填写 1 个目标词（每行一个）")
+    return out
+
+
+def _build_char_stream(entries: List[dict]) -> List[dict]:
+    """按字幕原顺序连接正文的非空白字符。
+
+    返回每个字符的归属信息：{ch, entry}（entry 为所属字幕下标）。
+    字幕自身的块内顺序与条目顺序即「原顺序」；空白字符不进入字符流，
+    也不占用字幕时长份额。
+    """
+    stream = []
+    for ei, e in enumerate(entries):
+        for line in e["lines"]:
+            for ch in line:
+                if not ch.isspace():
+                    stream.append({"ch": ch, "entry": ei})
+    return stream
+
+
+def find_word_hits(entries: List[dict], words: List[tuple]) -> List[dict]:
+    """在按原顺序连接的非空白字符流上对每个目标词做大小写敏感的字面匹配。
+
+    - 目标词先去除行内全部空白；匹配为大小写敏感的纯字面子串匹配，
+      允许相互重叠的命中；
+    - 仅当命中跨度内每一对相邻字幕的间隔（后条起点 − 前条终点）
+      ≤ 500ms 时允许跨块命中，否则该跨块出现被忽略（块内命中不受限）；
+    - 每个字符按其所在字幕时长等分子区间，命中区间取首字符子区间的
+      外侧起点与末字符子区间的外侧终点（跨块不补中间间隔）。
+    """
+    entry_nonws = [
+        sum(1 for ln in e["lines"] for ch in ln if not ch.isspace())
+        for e in entries
+    ]
+    stream = _build_char_stream(entries)
+    n = len(stream)
+    # 每个字符在其所属字幕内的非空白字符序号（0 起）
+    local_pos = [0] * n
+    seen = [0] * len(entries)
+    for i, c in enumerate(stream):
+        local_pos[i] = seen[c["entry"]]
+        seen[c["entry"]] += 1
+    text = "".join(c["ch"] for c in stream)
+
+    def span_range(p: int, q: int):
+        """字符流 [p, q] 的 (起点ms, 终点ms)，端点取字幕边界避免漂移。"""
+        ci_first, ci_last = stream[p]["entry"], stream[q]["entry"]
+        fe, le = entries[ci_first], entries[ci_last]
+        kf, kl = local_pos[p], local_pos[q]
+        nf, nl = entry_nonws[ci_first], entry_nonws[ci_last]
+        lo = float(fe["start"]) if kf == 0 else fe["start"] + (fe["end"] - fe["start"]) * kf / nf
+        hi = float(le["end"]) if kl + 1 == nl else \
+            le["start"] + (le["end"] - le["start"]) * (kl + 1) / nl
+        return lo, hi
+
+    def gap_ok(p: int, q: int) -> bool:
+        """跨度 [p, q] 内每一对相邻字幕间隔均 ≤ 500ms 才允许跨块。
+
+        含中间无正文非空白字符的条目：间隔按相邻条目逐条检查
+        （entries 原顺序，空时长 / 倒置 / 轨内重叠已在预处理拦截）。
+        """
+        a, b = stream[p]["entry"], stream[q]["entry"]
+        for k in range(a, b):
+            if entries[k + 1]["start"] - entries[k]["end"] > WORD_CROSS_GAP_MS:
+                return False
+        return True
+
+    hits = []
+    for row, word in words:
+        L = len(word)
+        if L == 0 or n == 0:
+            continue
+        start = 0
+        while True:
+            p = text.find(word, start)
+            if p < 0:
+                break
+            q = p + L - 1
+            if gap_ok(p, q):
+                lo, hi = span_range(p, q)
+                fi, li = stream[p]["entry"], stream[q]["entry"]
+                # 仅列入实际贡献了字符的字幕（去重、按原顺序）
+                idx_e = []
+                for pos in range(p, q + 1):
+                    idx = entries[stream[pos]["entry"]]["index"]
+                    if not idx_e or idx_e[-1] != idx:
+                        idx_e.append(idx)
+                hits.append({
+                    "word": word,
+                    "row": row,
+                    "start_ms": lo,
+                    "end_ms": hi,
+                    "cross_block": fi != li,
+                    "indices": idx_e,
+                })
+            start = p + 1  # 允许重叠命中（如 aa 在 aaa 中出现两次）
+    hits.sort(key=lambda h: (h["start_ms"], h["end_ms"], h["row"], h["word"]))
+    return hits
+
+
+def merge_hit_intervals(hits: List[dict], pre_ms: float, post_ms: float) -> List[dict]:
+    """对命中区间做前后扩展并合并重叠 / 相接区间。
+
+    扩展后起点小于 0 时截为 0（终点不截）；区间按起点排序后，
+    后段起点 ≤ 前段终点（含端点相接）即合并为同一区间。
+    同一合并区间内去重收集目标词与原字幕序号。
+    """
+    expanded = []
+    for h in hits:
+        s = max(0.0, h["start_ms"] - pre_ms)
+        e = h["end_ms"] + post_ms
+        expanded.append((s, e, h))
+    expanded.sort(key=lambda x: (x[0], x[1]))
+
+    merged = []
+    for s, e, h in expanded:
+        if merged and s <= merged[-1]["end_ms"]:
+            seg = merged[-1]
+            if e > seg["end_ms"]:
+                seg["end_ms"] = e
+            if h["word"] not in seg["words"]:
+                seg["words"].append(h["word"])
+            for idx in h["indices"]:
+                if idx not in seg["indices"]:
+                    seg["indices"].append(idx)
+            seg["hit_count"] += 1
+        else:
+            merged.append({
+                "start_ms": s,
+                "end_ms": e,
+                "words": [h["word"]],
+                "indices": list(h["indices"]),
+                "hit_count": 1,
+            })
+    return merged
+
+
+def _word_prepare(req: "WordMarkRequest"):
+    """目标词标记公共预处理：参数校验、SRT 解析与轨道校验，失败抛 400。"""
+    if not math.isfinite(req.pre_ms) or req.pre_ms < 0:
+        raise HTTPException(status_code=400, detail="向前扩展毫秒须为非负数")
+    if not math.isfinite(req.post_ms) or req.post_ms < 0:
+        raise HTTPException(status_code=400, detail="向后扩展毫秒须为非负数")
+    try:
+        entries = parse_srt(req.srt)
+        _validate_speed_track(entries)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        words = _parse_target_words(req.words)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entries, words, req.pre_ms, req.post_ms
+
+
+def _word_hit_payload(h: dict) -> dict:
+    return {
+        "word": h["word"],
+        "row": h["row"],
+        "start": fmt_time(int(round(h["start_ms"]))),
+        "end": fmt_time(int(round(h["end_ms"]))),
+        "start_ms": int(round(h["start_ms"])),
+        "end_ms": int(round(h["end_ms"])),
+        "cross_block": h["cross_block"],
+        "indices": h["indices"],
+    }
+
+
+def _word_segment_payload(seq: int, seg: dict) -> dict:
+    start_ms = int(round(seg["start_ms"]))
+    end_ms = int(round(seg["end_ms"]))
+    return {
+        "seq": seq,
+        "start": fmt_time(start_ms),
+        "end": fmt_time(end_ms),
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "duration_ms": end_ms - start_ms,
+        "words": seg["words"],
+        "indices": seg["indices"],
+        "hit_count": seg["hit_count"],
+    }
+
+
+@app.post("/api/wordmark/preview")
+def wordmark_preview(req: WordMarkRequest):
+    entries, words, pre_ms, post_ms = _word_prepare(req)
+    hits = find_word_hits(entries, words)
+    segments = merge_hit_intervals(hits, pre_ms, post_ms)
+    hit_rows = {h["row"] for h in hits}
+    unmatched = [
+        {"row": row, "word": word}
+        for row, word in words if row not in hit_rows
+    ]
+    return {
+        "entry_count": len(entries),
+        "word_count": len(words),
+        "pre_ms": int(round(pre_ms)),
+        "post_ms": int(round(post_ms)),
+        "hit_count": len(hits),
+        "segment_count": len(segments),
+        "hits": [_word_hit_payload(h) for h in hits],
+        "segments": [_word_segment_payload(k, s) for k, s in enumerate(segments, 1)],
+        "unmatched": unmatched,
+    }
+
+
+_WORD_CSV_HEADER = ["序号", "起点(ms)", "终点(ms)", "时长(ms)",
+                    "起点", "终点", "命中词", "原字幕序号", "命中次数"]
+
+
+@app.post("/api/wordmark/export")
+def wordmark_export(req: WordMarkRequest):
+    entries, words, pre_ms, post_ms = _word_prepare(req)
+    hits = find_word_hits(entries, words)
+    segments = merge_hit_intervals(hits, pre_ms, post_ms)
+    if not segments:
+        raise HTTPException(status_code=400, detail="没有任何目标词命中，没有可导出的区间")
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")  # RFC 4180：CRLF、按需加引号
+    writer.writerow(_WORD_CSV_HEADER)
+    for k, seg in enumerate(segments, 1):
+        s_ms = int(round(seg["start_ms"]))
+        e_ms = int(round(seg["end_ms"]))
+        writer.writerow([
+            k,
+            s_ms,
+            e_ms,
+            e_ms - s_ms,
+            fmt_time(s_ms),
+            fmt_time(e_ms),
+            "、".join(seg["words"]),
+            "、".join(seg["indices"]),
+            seg["hit_count"],
+        ])
+    # UTF-8 BOM，确保 Excel 直接双击打开时中文不乱码
+    return Response(
+        content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="word_mark_intervals.csv"'},
     )

@@ -244,6 +244,48 @@
   <div id="diffResult"></div>
 </div>
 
+<hr class="feature-divider">
+<h1 id="wordmark">字幕目标词时间标记</h1>
+<p class="hint">粘贴一份 SRT 与<strong>逐行目标词</strong>（每行一个，行内空白自动忽略），
+按字幕原顺序把正文的<strong>非空白字符</strong>连接成字符流，对每个目标词做<strong>大小写敏感的字面匹配</strong>（允许重叠命中）。
+仅当命中跨越相邻字幕、且沿途<strong>每对相邻字幕间隔 ≤ 500ms</strong> 时才允许跨块；
+每个字符按<strong>所在字幕时长等分</strong>，命中区间取首字符子区间的外侧起点与末字符子区间的外侧终点。
+可设置非负的<strong>前 / 后扩展毫秒</strong>：扩展后起点小于 0 截为 0，<strong>重叠或端点相接的区间合并</strong>。
+字幕出现<strong>空时长、起止倒置或轨内重叠</strong>会直接报错。确认预览后可下载合并区间 CSV。</p>
+
+<div class="card">
+  <h2>12. SRT 与逐行目标词</h2>
+  <div class="track-grid">
+    <div class="track-box">
+      <h3>SRT 字幕
+        <input type="file" id="wmFile" accept=".srt,.txt" style="font-size:12px;font-weight:normal">
+      </h3>
+      <textarea id="wmSrt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;Hello world&#10;&#10;2&#10;00:00:03,200 --> 00:00:05,000&#10;foo bar"></textarea>
+    </div>
+    <div class="track-box">
+      <h3>逐行目标词（每行一个）</h3>
+      <textarea id="wmWords" style="min-height:200px" placeholder="world&#10;foobar"></textarea>
+    </div>
+  </div>
+  <div class="toolbar">
+    <span class="hint">向前扩展 ms</span>
+    <input type="number" id="wmPre" min="0" step="50" value="0" style="width:110px">
+    <span class="hint">向后扩展 ms</span>
+    <input type="number" id="wmPost" min="0" step="50" value="0" style="width:110px">
+  </div>
+</div>
+
+<div class="card">
+  <h2>13. 预览命中与下载合并区间 CSV</h2>
+  <div class="toolbar">
+    <button onclick="wmPreview()">预览命中</button>
+    <button id="wmExportBtn" onclick="wmExport()" disabled>下载合并区间 CSV</button>
+    <span class="hint" id="wmExportHint">请先预览，校验通过且存在命中时才能下载</span>
+  </div>
+  <div id="wmMessage"></div>
+  <div id="wmResult"></div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 
@@ -809,6 +851,132 @@ async function diffExport() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "srt_diff.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 字幕目标词时间标记
+
+bindTrackFile("wmFile", "wmSrt");
+
+function wmPayload() {
+  const pre = parseFloat($("wmPre").value);
+  const post = parseFloat($("wmPost").value);
+  return JSON.stringify({
+    srt: $("wmSrt").value,
+    words: $("wmWords").value,
+    pre_ms: isFinite(pre) ? pre : 0,
+    post_ms: isFinite(post) ? post : 0,
+  });
+}
+
+function showWmError(msg) {
+  $("wmMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("wmResult").innerHTML = "";
+  $("wmExportBtn").disabled = true;
+}
+
+function wmErrDetail(data) {
+  if (!data || data.detail == null) return "请求失败";
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return data.detail.map(d => d.msg || JSON.stringify(d)).join("；");
+  return data.detail.message || JSON.stringify(data.detail);
+}
+
+function renderWmPreview(pv) {
+  const hitRows = pv.hits.map(h => `
+    <tr>
+      <td>${h.row}</td>
+      <td class="mono">${escapeHtml(h.word)}</td>
+      <td class="mono">${escapeHtml(h.start)} --&gt; ${escapeHtml(h.end)}</td>
+      <td>${h.start_ms} – ${h.end_ms}</td>
+      <td class="mono">${escapeHtml(h.indices.join("、"))}${h.cross_block ? '<span class="merged-tag">跨块</span>' : ""}</td>
+    </tr>`).join("");
+  const hitTable = pv.hit_count ? `<table>
+      <tr><th style="width:3em">目标词行</th><th>命中词</th><th>估算时间区间</th><th>毫秒</th><th>原字幕序号</th></tr>
+      ${hitRows}
+    </table>` : `<div class="hint">没有任何命中。</div>`;
+
+  const segRows = pv.segments.map(s => `
+    <tr>
+      <td>${s.seq}</td>
+      <td class="mono">${escapeHtml(s.start)} --&gt; ${escapeHtml(s.end)}</td>
+      <td>${s.start_ms} – ${s.end_ms}</td>
+      <td>${s.duration_ms}</td>
+      <td class="mono">${escapeHtml(s.words.join("、"))}</td>
+      <td class="mono">${escapeHtml(s.indices.join("、"))}</td>
+      <td>${s.hit_count}</td>
+    </tr>`).join("");
+  const segTable = pv.segment_count ? `<table>
+      <tr><th style="width:3em">#</th><th>合并后区间</th><th>毫秒</th><th>时长(ms)</th><th>命中词</th><th>原字幕序号</th><th>命中数</th></tr>
+      ${segRows}
+    </table>` : "";
+
+  const unmatched = pv.unmatched.length
+    ? `<h3 style="font-size:14px;margin:12px 0 6px">未命中目标词（${pv.unmatched.length} 行）</h3>
+       <table>
+         <tr><th style="width:3em">行号</th><th>目标词</th></tr>
+         ${pv.unmatched.map(u => `
+           <tr class="unmatched"><td>${u.row}</td><td class="mono">${escapeHtml(u.word)}</td></tr>`).join("")}
+       </table>`
+    : "";
+
+  $("wmResult").innerHTML =
+    `<h3 style="font-size:14px;margin:8px 0">逐命中（${pv.hit_count} 处）</h3>${hitTable}` +
+    (pv.segment_count ? `<h3 style="font-size:14px;margin:12px 0 6px">合并后区间（${pv.segment_count} 段，` +
+      `前扩展 ${pv.pre_ms}ms / 后扩展 ${pv.post_ms}ms）</h3>${segTable}` : "") +
+    unmatched;
+
+  if (pv.segment_count === 0) {
+    $("wmMessage").innerHTML =
+      `<div class="bad-banner">✗ 共 ${pv.word_count} 个目标词，没有任何命中，无法下载 CSV。</div>`;
+    $("wmExportBtn").disabled = true;
+  } else {
+    $("wmMessage").innerHTML =
+      `<div class="ok-banner">✓ 字幕 ${pv.entry_count} 条 / 目标词 ${pv.word_count} 个，` +
+      `命中 ${pv.hit_count} 处，合并为 ${pv.segment_count} 个区间` +
+      (pv.unmatched.length ? `（${pv.unmatched.length} 个目标词未命中）` : "") +
+      `，可以下载。</div>`;
+    $("wmExportBtn").disabled = false;
+  }
+}
+
+async function wmPreview() {
+  $("wmMessage").innerHTML = "";
+  const pre = parseFloat($("wmPre").value);
+  const post = parseFloat($("wmPost").value);
+  if ($("wmPre").value !== "" && (!isFinite(pre) || pre < 0)) {
+    return showWmError("向前扩展毫秒须为非负数");
+  }
+  if ($("wmPost").value !== "" && (!isFinite(post) || post < 0)) {
+    return showWmError("向后扩展毫秒须为非负数");
+  }
+  let res;
+  try {
+    res = await fetch("/api/wordmark/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: wmPayload(),
+    });
+  } catch (e) { return showWmError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderWmPreview(data);
+  return showWmError(wmErrDetail(data));
+}
+
+async function wmExport() {
+  let res;
+  try {
+    res = await fetch("/api/wordmark/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: wmPayload(),
+    });
+  } catch (e) { return showWmError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showWmError(wmErrDetail(data) || "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "word_mark_intervals.csv";
   a.click();
   URL.revokeObjectURL(a.href);
 }
