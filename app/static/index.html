@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SRT 字幕时间校准</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 1080px; margin: 0 auto; padding: 24px; color: #222; background: #f6f7f9; }
+  h1 { font-size: 22px; }
+  h2 { font-size: 16px; margin: 24px 0 8px; }
+  .card { background: #fff; border: 1px solid #e3e5e8; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  textarea { width: 100%; min-height: 160px; font-family: ui-monospace, Consolas, monospace;
+             font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 6px; resize: vertical; }
+  input[type=text], input[type=number] { font-family: ui-monospace, Consolas, monospace; font-size: 13px;
+             padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; width: 150px; }
+  button { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer;
+           background: #2563eb; color: #fff; font-size: 14px; }
+  button.secondary { background: #e5e7eb; color: #222; }
+  button.danger { background: #fee2e2; color: #b91c1c; padding: 4px 10px; font-size: 13px; }
+  button:disabled { background: #9ca3af; cursor: not-allowed; }
+  .anchor-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .hint { color: #6b7280; font-size: 13px; }
+  .error { background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c;
+           padding: 10px 14px; border-radius: 6px; margin: 12px 0; white-space: pre-wrap; }
+  .ok-banner { background: #ecfdf5; border: 1px solid #a7f3d0; color: #047857;
+           padding: 10px 14px; border-radius: 6px; margin: 12px 0; }
+  .bad-banner { background: #fff7ed; border: 1px solid #fed7aa; color: #c2410c;
+           padding: 10px 14px; border-radius: 6px; margin: 12px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+  th, td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: #f9fafb; }
+  tr.problem { background: #fef2f2; }
+  .anchor-row.suggested-remove { background: #fef2f2; border: 1px dashed #fca5a5;
+           border-radius: 6px; padding: 4px 6px; }
+  .anchor-row.suggested-remove input { text-decoration: line-through; }
+  .suggest-banner { background: #fffbeb; border: 1px solid #fcd34d; color: #92400e;
+           padding: 10px 14px; border-radius: 6px; margin: 12px 0; white-space: pre-wrap; }
+  .suggest-banner .row-list { font-family: ui-monospace, Consolas, monospace; font-weight: 600; }
+  .suggest-actions { margin-top: 8px; display: flex; gap: 8px; align-items: center; }
+  button.warn { background: #f59e0b; color: #1f2937; }
+  .anchor-row .row-no { color: #6b7280; font-size: 12px; width: 3.2em;
+           font-family: ui-monospace, Consolas, monospace; }
+  .flag { display: inline-block; background: #fee2e2; color: #b91c1c; border-radius: 4px;
+          padding: 1px 6px; font-size: 12px; margin-right: 4px; }
+  .mono { font-family: ui-monospace, Consolas, monospace; white-space: pre-wrap; }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+  .feature-divider { border: none; border-top: 2px dashed #d1d5db; margin: 32px 0 20px; }
+  .interval-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .interval-row .row-no { color: #6b7280; font-size: 12px; width: 3.2em;
+           font-family: ui-monospace, Consolas, monospace; }
+  .track-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 760px) { .track-grid { grid-template-columns: 1fr; } }
+  .track-box h3 { margin: 0 0 6px; font-size: 14px; }
+  .track-box textarea { min-height: 200px; }
+  .tr-pair { border: 1px solid #e5e7eb; border-radius: 6px; padding: 6px 8px; margin-bottom: 6px;
+           background: #f9fafb; }
+  .tr-pair .tr-meta { color: #6b7280; font-size: 12px; margin-bottom: 2px; }
+  .tr-none { color: #9ca3af; font-size: 12px; }
+  .unmatched-list { margin-top: 12px; }
+  .unmatched-list tr.unmatched { background: #fffbeb; }
+  .merged-tag { display: inline-block; background: #dbeafe; color: #1d4ed8; border-radius: 4px;
+          padding: 1px 6px; font-size: 12px; margin-left: 4px; }
+  /* ---- SRT 修订差异对照 ---- */
+  .diff-side .tr-meta { color: #6b7280; font-size: 12px; margin-bottom: 2px; }
+  .diff-entry { border: 1px dashed #d1d5db; border-radius: 6px; padding: 4px 8px;
+          margin-bottom: 4px; background: #fff; }
+  .diff-none { color: #9ca3af; font-size: 12px; padding: 4px 2px; }
+  .diff-type { display: inline-block; border-radius: 4px; padding: 2px 8px; font-size: 12px;
+          font-weight: 600; white-space: nowrap; }
+  .diff-type.unchanged { background: #ecfdf5; color: #047857; }
+  .diff-type.changed   { background: #fef3c7; color: #92400e; }
+  .diff-type.split     { background: #dbeafe; color: #1d4ed8; }
+  .diff-type.merge     { background: #ede9fe; color: #6d28d9; }
+  .diff-type.delete    { background: #fee2e2; color: #b91c1c; }
+  .diff-type.add       { background: #dcfce7; color: #15803d; }
+  tr.diff-row-unchanged td { background: #fafafa; }
+  tr.diff-row-changed   td { background: #fffbeb; }
+  tr.diff-row-split     td { background: #eff6ff; }
+  tr.diff-row-merge     td { background: #f5f3ff; }
+  tr.diff-row-delete    td { background: #fef2f2; }
+  tr.diff-row-add       td { background: #f0fdf4; }
+  .diff-meta { color: #6b7280; font-size: 12px; }
+  .diff-changed-note { font-size: 12px; color: #b45309; margin-left: 6px; }
+</style>
+</head>
+<body>
+<h1>SRT 字幕时间校准</h1>
+<p class="hint">粘贴或上传 SRT，设置至少 2 个「原字幕时刻 → 视频实际时刻」锚点。
+相邻锚点间线性插值，两端按最近一段斜率外推。存在负时间、起止倒置或与下一条重叠时禁止导出。
+锚点校验失败时会自动给出「剔除最少锚点」的修复建议，确认剔除后即可继续预演与导出。</p>
+
+<div class="card">
+  <h2>1. 字幕内容（时间校准与下方剪辑功能共用）</h2>
+  <input type="file" id="file" accept=".srt,.txt">
+  <textarea id="srt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;第一句字幕&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;第二句字幕"></textarea>
+</div>
+
+<div class="card">
+  <h2>2. 校准锚点（至少 2 个，格式 HH:MM:SS,mmm）</h2>
+  <div id="anchors"></div>
+  <button class="secondary" onclick="addAnchor()">+ 添加锚点</button>
+</div>
+
+<div class="card">
+  <h2>3. 预览与导出</h2>
+  <div class="toolbar">
+    <button onclick="preview()">预览校准结果</button>
+    <button id="exportBtn" onclick="exportSrt()" disabled>导出校准后 SRT</button>
+    <span class="hint" id="exportHint">请先预览，且无问题字幕时才能导出</span>
+  </div>
+  <div id="message"></div>
+  <div id="result"></div>
+</div>
+
+<hr class="feature-divider">
+<h1 id="clip">剪辑片段字幕</h1>
+<p class="hint">按<strong>原视频时间</strong>填写多个保留区间（左闭右开，格式 HH:MM:SS,mmm）。
+每条字幕与各区间求交集：无交集的丢弃，跨区间的字幕拆成多条并保留正文；
+每段交集时间减去该区间起点、再累加此前区间总时长，得到剪辑后连续时间轴。
+区间起点须早于终点，按起点排序，重叠将被拒绝。</p>
+
+<div class="card">
+  <h2>4. 保留区间（至少 1 个）</h2>
+  <div class="hint" style="margin-bottom:8px">使用上方第 1 步的同一份 SRT 内容。</div>
+  <div id="clipIntervals"></div>
+  <button class="secondary" onclick="addInterval()">+ 添加区间</button>
+</div>
+
+<div class="card">
+  <h2>5. 预览与下载剪辑后 SRT</h2>
+  <div class="toolbar">
+    <button onclick="clipPreview()">预览剪辑结果</button>
+    <button id="clipExportBtn" onclick="clipExport()" disabled>下载剪辑后 SRT</button>
+    <span class="hint" id="clipExportHint">请先预览，且区间校验通过后才能下载</span>
+  </div>
+  <div id="clipMessage"></div>
+  <div id="clipResult"></div>
+</div>
+
+<hr class="feature-divider">
+<h1 id="merge">双语 SRT 合成</h1>
+<p class="hint">分别粘贴或上传<strong>主轨</strong>与<strong>译文轨</strong>两份 SRT，按时间全局配对后合成为双语字幕。
+每条主轨最多配 <strong>2</strong> 条译文、每条译文<strong>至多使用一次</strong>，仅有<strong>正时长交叠</strong>（端点相触不算）才会配对。
+全局优先<strong>最大化总交叠毫秒数</strong>；并列时优先<strong>少漏配译文</strong>（已配条数最多）；
+仍并列时，按已配译文<strong>原序号序列字典序最小</strong>决胜。两轨任一条出现<strong>空时长或起止倒置</strong>都会报错。</p>
+
+<div class="card">
+  <h2>6. 两轨字幕内容</h2>
+  <div class="track-grid">
+    <div class="track-box">
+      <h3>主轨（导出时间轴以此为准）
+        <input type="file" id="mergeMainFile" accept=".srt,.txt" style="font-size:12px;font-weight:normal">
+      </h3>
+      <textarea id="mergeMain" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;Hello world&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;Second line"></textarea>
+    </div>
+    <div class="track-box">
+      <h3>译文轨
+        <input type="file" id="mergeTransFile" accept=".srt,.txt" style="font-size:12px;font-weight:normal">
+      </h3>
+      <textarea id="mergeTrans" placeholder="1&#10;00:00:01,200 --> 00:00:03,000&#10;你好，世界&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;第二句"></textarea>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>7. 预览与下载双语 SRT</h2>
+  <div class="toolbar">
+    <button onclick="mergePreview()">预览配对结果</button>
+    <button id="mergeExportBtn" onclick="mergeExport()" disabled>下载双语 SRT</button>
+    <span class="hint" id="mergeExportHint">请先预览，两轨校验通过后才能下载</span>
+  </div>
+  <div id="mergeMessage"></div>
+  <div id="mergeResult"></div>
+</div>
+
+<hr class="feature-divider">
+<h1 id="speed">阅读速度修复</h1>
+<p class="hint">粘贴或上传 SRT，设置<strong>最大每秒字数</strong>与<strong>单块最长秒数</strong>（均为正数）。
+非空白字符各计一字，速度按每块起止跨度（首条起点 → 末条终点）计算；
+<strong>空时长、起止倒置或轨内重叠</strong>会直接报错。仅允许合并<strong>时间相邻且间隔 ≤ 500ms</strong> 的连续字幕，
+合并块沿用首条起点、末条终点，正文按原顺序换行拼接；每块须同时满足速度与最长时长限制。
+全局规划以<strong>合并次数最少</strong>为先，仍并列时选择<strong>切分位置序列字典序最小</strong>的方案；
+无可行方案时会指出无法修复。确认预览后下载从 1 连续重编号的 SRT。</p>
+
+<div class="card">
+  <h2>8. 字幕内容与限速参数</h2>
+  <input type="file" id="speedFile" accept=".srt,.txt">
+  <textarea id="speedSrt" placeholder="1&#10;00:00:01,000 --> 00:00:02,000&#10;第一句字幕&#10;&#10;2&#10;00:00:02,200 --> 00:00:03,200&#10;第二句字幕"></textarea>
+  <div class="toolbar">
+    <span class="hint">最大每秒字数</span>
+    <input type="number" id="maxCps" min="0" step="0.5" value="20" style="width:110px">
+    <span class="hint">单块最长秒数</span>
+    <input type="number" id="maxBlockSec" min="0" step="0.5" value="7" style="width:110px">
+  </div>
+</div>
+
+<div class="card">
+  <h2>9. 预览与下载修复后 SRT</h2>
+  <div class="toolbar">
+    <button onclick="speedPreview()">预览修复方案</button>
+    <button id="speedExportBtn" onclick="speedExport()" disabled>下载修复后 SRT</button>
+    <span class="hint" id="speedExportHint">请先预览，存在可行方案时才能下载</span>
+  </div>
+  <div id="speedMessage"></div>
+  <div id="speedResult"></div>
+</div>
+
+<hr class="feature-divider">
+<h1 id="diff">SRT 修订差异对照</h1>
+<p class="hint">分别粘贴或上传<strong>旧版</strong>与<strong>新版</strong>两份 SRT，自动按顺序对齐两版字幕并逐组对照。
+对齐在<strong>保持原有顺序</strong>的前提下做全局动态规划，每组允许 <strong>1:1（改词/未变）、1:2（拆分）、2:1（合并）以及单侧跳过（删除/新增）</strong>。
+相似度基于<strong>去除空白与标点并小写化</strong>后的正文计算，只有相似度 <strong>≥ 0.5</strong> 的组合才允许匹配；
+全局优先<strong>最大化相似度总和</strong>，总分相同时选择<strong>时间差总和更小</strong>的方案。
+拆分组与合并组按整段对照，不会把拆分/合并后的段落误报成改词或删除/新增。</p>
+
+<div class="card">
+  <h2>10. 两版字幕内容</h2>
+  <div class="track-grid">
+    <div class="track-box">
+      <h3>旧版 SRT
+        <input type="file" id="diffOldFile" accept=".srt,.txt" style="font-size:12px;font-weight:normal">
+      </h3>
+      <textarea id="diffOld" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;旧版第一句&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;旧版第二句"></textarea>
+    </div>
+    <div class="track-box">
+      <h3>新版 SRT
+        <input type="file" id="diffNewFile" accept=".srt,.txt" style="font-size:12px;font-weight:normal">
+      </h3>
+      <textarea id="diffNew" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;新版第一句&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;新版第二句"></textarea>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>11. 预览与下载差异 CSV</h2>
+  <div class="toolbar">
+    <button onclick="diffPreview()">预览差异对照</button>
+    <button id="diffExportBtn" onclick="diffExport()" disabled>下载 UTF-8 CSV</button>
+    <span class="hint" id="diffExportHint">请先预览，两版校验通过后才能下载</span>
+  </div>
+  <div id="diffMessage"></div>
+  <div id="diffResult"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+// 文件上传 -> 读入 textarea
+$("file").addEventListener("change", e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => { $("srt").value = r.result; };
+  r.readAsText(f);
+});
+
+function addAnchor(orig = "", actual = "") {
+  const div = document.createElement("div");
+  div.className = "anchor-row";
+  div.innerHTML =
+    `<span class="row-no"></span>` +
+    `<span class="hint">原时刻</span><input type="text" class="orig" placeholder="00:01:00,000" value="${orig}">` +
+    `<span class="hint">→ 实际时刻</span><input type="text" class="actual" placeholder="00:01:02,500" value="${actual}">` +
+    `<button class="danger" onclick="this.parentElement.remove()">删除</button>`;
+  $("anchors").appendChild(div);
+  numberAnchors();
+}
+addAnchor(); addAnchor();
+
+function anchorRows() {
+  // 与 collectAnchors 的过滤规则一致：返回的节点就是参与提交、带输入行号的锚点
+  return [...document.querySelectorAll("#anchors .anchor-row")]
+    .filter(row => {
+      const o = row.querySelector(".orig").value.trim();
+      const a = row.querySelector(".actual").value.trim();
+      return o || a;
+    });
+}
+
+function numberAnchors() {
+  anchorRows().forEach((row, i) => { row.querySelector(".row-no").textContent = `#${i + 1}`; });
+}
+
+$("anchors").addEventListener("input", () => numberAnchors());
+
+function collectAnchors() {
+  return anchorRows().map(row => ({
+    orig: row.querySelector(".orig").value.trim(),
+    actual: row.querySelector(".actual").value.trim(),
+  }));
+}
+
+function payload() {
+  return JSON.stringify({ srt: $("srt").value, anchors: collectAnchors() });
+}
+
+function showError(msg) {
+  $("message").innerHTML = `<div class="error">⚠ ${msg}</div>`;
+  $("result").innerHTML = "";
+  $("exportBtn").disabled = true;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function errDetail(data) {
+  return (data && typeof data.detail === "object") ? data.detail.message : (data?.detail || "请求失败");
+}
+
+function renderPreview(pv) {
+  const rows = pv.entries.map(e => `
+    <tr class="${e.flags.length ? "problem" : ""}">
+      <td>${escapeHtml(e.index)}</td>
+      <td class="mono">${escapeHtml(e.old)}</td>
+      <td class="mono">${escapeHtml(e.new)}</td>
+      <td>${e.flags.map(f => `<span class="flag">${escapeHtml(f)}</span>`).join("")}</td>
+      <td class="mono">${escapeHtml(e.text)}</td>
+    </tr>`).join("");
+  $("result").innerHTML = `<table>
+    <tr><th>#</th><th>原时间</th><th>校准后时间</th><th>问题</th><th>正文</th></tr>${rows}</table>`;
+  if (pv.ok) {
+    $("message").innerHTML = `<div class="ok-banner">✓ 共 ${pv.entries.length} 条，全部正常，可以导出。</div>`;
+    $("exportBtn").disabled = false;
+  } else {
+    $("message").innerHTML = `<div class="bad-banner">✗ 发现 ${pv.problem_count} 条问题字幕（负时间 / 起止倒置 / 与下一条重叠），已禁止导出。</div>`;
+    $("exportBtn").disabled = true;
+  }
+}
+
+function clearSuggestionMarks() {
+  document.querySelectorAll("#anchors .anchor-row.suggested-remove")
+    .forEach(row => row.classList.remove("suggested-remove"));
+}
+
+async function preview() {
+  $("message").innerHTML = "";
+  clearSuggestionMarks();
+  let res;
+  try {
+    res = await fetch("/api/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: payload(),
+    });
+  } catch (e) { return showError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderPreview(data);
+
+  // 锚点校验失败：请求异常定位建议
+  if (data && typeof data.detail === "object" && data.detail.type === "anchor_invalid") {
+    return showSuggestion(data.detail.message);
+  }
+  return showError(errDetail(data));
+}
+
+async function showSuggestion(reason) {
+  let res;
+  try {
+    res = await fetch("/api/suggest", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: payload(),
+    });
+  } catch (e) { return showError("网络错误：" + e); }
+  const data = await res.json();
+  if (!res.ok) return showError(errDetail(data));
+
+  if (!data.feasible) {
+    showError("锚点校验失败：" + reason + "\n无法预演：" + data.reason);
+    return;
+  }
+
+  const rows = anchorRows();
+  data.remove_rows.forEach(rn => {
+    const row = rows[rn - 1];
+    if (row) row.classList.add("suggested-remove");
+  });
+
+  const detail = data.removed.map(r => `#${r.row}：${r.orig || "（空）"} → ${r.actual || "（空）"} —— ${r.reason}`).join("\n");
+  $("message").innerHTML =
+    `<div class="suggest-banner">` +
+    `⚠ 锚点校验失败：${escapeHtml(reason)}\n` +
+    `建议剔除最少 <strong>${data.remove_rows.length}</strong> 个锚点：` +
+    `<span class="row-list">${data.remove_rows.map(r => "#" + r).join("、")}</span>` +
+    `（保留 ${data.kept.length} 个）。下方已用红框标出待剔除行，红色行为建议，尚未改动输入。\n` +
+    `${escapeHtml(detail)}` +
+    `<div class="suggest-actions">` +
+    `<button class="warn" onclick="confirmRemoveAnchors()">确认剔除并继续</button>` +
+    `<button class="secondary" onclick="cancelSuggestion()">放弃建议（保留输入）</button>` +
+    `</div></div>`;
+  $("exportBtn").disabled = true;
+
+  if (data.preview) {
+    renderPreview(data.preview);
+  } else {
+    $("result").innerHTML =
+      `<div class="error" style="margin-top:8px">SRT 内容无法解析，暂不能显示受影响字幕：${escapeHtml(data.preview_error || "")}</div>`;
+  }
+}
+
+function confirmRemoveAnchors() {
+  const doomed = document.querySelectorAll("#anchors .anchor-row.suggested-remove");
+  doomed.forEach(row => row.remove());
+  numberAnchors();
+  preview();
+}
+
+function cancelSuggestion() {
+  clearSuggestionMarks();
+  $("message").innerHTML = `<div class="bad-banner">已放弃建议，输入未改动。请手动修正锚点后重新预览。</div>`;
+  $("result").innerHTML = "";
+  $("exportBtn").disabled = true;
+}
+
+async function exportSrt() {
+  let res;
+  try {
+    res = await fetch("/api/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: payload(),
+    });
+  } catch (e) { return showError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showError(errDetail(data) || "导出被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "calibrated.srt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 剪辑片段字幕
+
+function addInterval(start = "", end = "") {
+  const div = document.createElement("div");
+  div.className = "interval-row";
+  div.innerHTML =
+    `<span class="row-no"></span>` +
+    `<span class="hint">保留</span><input type="text" class="iv-start" placeholder="起点 00:01:00,000" value="${start}">` +
+    `<span class="hint">→</span><input type="text" class="iv-end" placeholder="终点 00:02:00,000" value="${end}">` +
+    `<button class="danger" onclick="this.parentElement.remove(); numberIntervals();">删除</button>`;
+  $("clipIntervals").appendChild(div);
+  numberIntervals();
+}
+addInterval();
+
+function intervalRows() {
+  // 起止全空的行不参与提交，与锚点区域的过滤规则保持一致
+  return [...document.querySelectorAll("#clipIntervals .interval-row")]
+    .filter(row => {
+      const s = row.querySelector(".iv-start").value.trim();
+      const e = row.querySelector(".iv-end").value.trim();
+      return s || e;
+    });
+}
+
+function numberIntervals() {
+  intervalRows().forEach((row, i) => { row.querySelector(".row-no").textContent = `#${i + 1}`; });
+}
+
+$("clipIntervals").addEventListener("input", () => numberIntervals());
+
+function collectIntervals() {
+  return intervalRows().map(row => ({
+    start: row.querySelector(".iv-start").value.trim(),
+    end: row.querySelector(".iv-end").value.trim(),
+  }));
+}
+
+function clipPayload() {
+  return JSON.stringify({ srt: $("srt").value, intervals: collectIntervals() });
+}
+
+function showClipError(msg) {
+  $("clipMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("clipResult").innerHTML = "";
+  $("clipExportBtn").disabled = true;
+}
+
+function renderClipPreview(pv) {
+  const rows = pv.entries.map(e => `
+    <tr>
+      <td>${escapeHtml(e.index)}</td>
+      <td>${escapeHtml(e.source)}</td>
+      <td class="mono">${escapeHtml(e.old)}</td>
+      <td class="mono">${escapeHtml(e.new)}</td>
+      <td class="mono">${escapeHtml(e.text)}</td>
+    </tr>`).join("");
+  $("clipResult").innerHTML = `<table>
+    <tr><th>新序号</th><th>原序号</th><th>原时间（交集）</th><th>剪辑后时间</th><th>正文</th></tr>${rows}</table>`;
+  const dur = `共 ${pv.interval_count} 个保留区间，拼接后总时长 ${pv.total_duration}，保留字幕 ${pv.entry_count} 条`;
+  if (pv.entry_count === 0) {
+    $("clipMessage").innerHTML =
+      `<div class="bad-banner">✗ ${dur}；没有任何字幕与保留区间相交，无法下载。</div>`;
+    $("clipExportBtn").disabled = true;
+  } else {
+    $("clipMessage").innerHTML = `<div class="ok-banner">✓ ${dur}，可以下载。</div>`;
+    $("clipExportBtn").disabled = false;
+  }
+}
+
+async function clipPreview() {
+  $("clipMessage").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/clip/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: clipPayload(),
+    });
+  } catch (e) { return showClipError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderClipPreview(data);
+  return showClipError((data && typeof data.detail === "string") ? data.detail : "请求失败");
+}
+
+async function clipExport() {
+  let res;
+  try {
+    res = await fetch("/api/clip/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: clipPayload(),
+    });
+  } catch (e) { return showClipError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showClipError((data && typeof data.detail === "string") ? data.detail : "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "clipped.srt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 双语 SRT 合成
+
+function bindTrackFile(fileId, areaId) {
+  $(fileId).addEventListener("change", e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => { $(areaId).value = r.result; };
+    r.readAsText(f);
+  });
+}
+bindTrackFile("mergeMainFile", "mergeMain");
+bindTrackFile("mergeTransFile", "mergeTrans");
+
+function mergePayload() {
+  return JSON.stringify({ main: $("mergeMain").value, translation: $("mergeTrans").value });
+}
+
+function showMergeError(msg) {
+  $("mergeMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("mergeResult").innerHTML = "";
+  $("mergeExportBtn").disabled = true;
+}
+
+function renderMergePreview(pv) {
+  const rows = pv.entries.map(e => {
+    const pairs = e.translations.length
+      ? e.translations.map(t => `
+          <div class="tr-pair">
+            <div class="tr-meta">译文 #${t.seq}（原序号 ${escapeHtml(t.index)}） ·
+              ${escapeHtml(t.time)} · 交叠 ${t.overlap_ms} ms</div>
+            <div class="mono">${escapeHtml(t.text)}</div>
+          </div>`).join("")
+      : `<div class="tr-none">（无配对译文，导出时仍保留本主轨条）</div>`;
+    return `
+      <tr>
+        <td>${e.seq}</td>
+        <td>
+          <div class="tr-meta">原序号 ${escapeHtml(e.index)} · ${escapeHtml(e.time)}</div>
+          <div class="mono">${escapeHtml(e.text)}</div>
+        </td>
+        <td>${pairs}</td>
+      </tr>`;
+  }).join("");
+  const unmatchedRows = pv.unmatched.map(t => `
+      <tr class="unmatched">
+        <td>${t.seq}</td>
+        <td>${escapeHtml(t.index)}</td>
+        <td class="mono">${escapeHtml(t.time)}</td>
+        <td class="mono">${escapeHtml(t.text)}</td>
+      </tr>`).join("");
+  $("mergeResult").innerHTML =
+    `<table>
+       <tr><th style="width:3em">#</th><th style="width:38%">主轨</th><th>配对译文（至多 2 条）</th></tr>
+       ${rows}
+     </table>
+     <div class="unmatched-list">
+       <h3 style="font-size:14px;margin:8px 0">未配对译文（${pv.unmatched_count} 条，不会写入导出文件）</h3>
+       ${pv.unmatched_count ? `<table>
+         <tr><th style="width:3em">#</th><th style="width:4em">原序号</th><th>时间</th><th>正文</th></tr>
+         ${unmatchedRows}
+       </table>` : `<div class="hint">无，所有译文均已配对。</div>`}
+     </div>`;
+  $("mergeMessage").innerHTML =
+    `<div class="ok-banner">✓ 主轨 ${pv.main_count} 条 / 译文 ${pv.trans_count} 条；` +
+    `已配 ${pv.matched_count} 条、漏配 ${pv.unmatched_count} 条；` +
+    `最优总交叠 ${pv.total_overlap_ms} ms（${pv.total_overlap}），可以下载。</div>`;
+  $("mergeExportBtn").disabled = false;
+}
+
+async function mergePreview() {
+  $("mergeMessage").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/merge/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: mergePayload(),
+    });
+  } catch (e) { return showMergeError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderMergePreview(data);
+  return showMergeError((typeof data.detail === "string") ? data.detail : "请求失败");
+}
+
+async function mergeExport() {
+  let res;
+  try {
+    res = await fetch("/api/merge/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: mergePayload(),
+    });
+  } catch (e) { return showMergeError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showMergeError((typeof data.detail === "string") ? data.detail : "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "bilingual.srt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 阅读速度修复
+
+bindTrackFile("speedFile", "speedSrt");
+
+function speedParams() {
+  const cps = parseFloat($("maxCps").value);
+  const sec = parseFloat($("maxBlockSec").value);
+  if (!isFinite(cps) || cps <= 0) { showSpeedError("最大每秒字数须为正数"); return null; }
+  if (!isFinite(sec) || sec <= 0) { showSpeedError("单块最长秒数须为正数"); return null; }
+  return { srt: $("speedSrt").value, max_cps: cps, max_block_seconds: sec };
+}
+
+function showSpeedError(msg) {
+  $("speedMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("speedResult").innerHTML = "";
+  $("speedExportBtn").disabled = true;
+}
+
+function speedErrDetail(data) {
+  if (!data || data.detail == null) return "请求失败";
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return data.detail.map(d => d.msg || JSON.stringify(d)).join("；");
+  return data.detail.message || JSON.stringify(data.detail);
+}
+
+function renderSpeedPreview(pv) {
+  const rows = pv.blocks.map(b => `
+    <tr>
+      <td>${b.seq}</td>
+      <td>${escapeHtml(b.sources.join("、"))}${b.merged ? '<span class="merged-tag">合并</span>' : ""}</td>
+      <td class="mono">${escapeHtml(b.start)} --&gt; ${escapeHtml(b.end)}</td>
+      <td>${(b.duration_ms / 1000).toFixed(2)}s</td>
+      <td>${b.chars}</td>
+      <td>${b.cps.toFixed(2)}</td>
+      <td class="mono">${escapeHtml(b.text)}</td>
+    </tr>`).join("");
+  $("speedResult").innerHTML = `<table>
+    <tr><th>新序号</th><th>来源序号</th><th>时间</th><th>时长</th><th>字数</th><th>速度(字/秒)</th><th>合并正文</th></tr>${rows}</table>`;
+  $("speedMessage").innerHTML =
+    `<div class="ok-banner">✓ 共 ${pv.entry_count} 条 → ${pv.block_count} 块（合并 ${pv.merge_count} 次），` +
+    `每块均满足 ≤ ${pv.max_cps} 字/秒、单块 ≤ ${pv.max_block_seconds} 秒，可以下载。</div>`;
+  $("speedExportBtn").disabled = false;
+}
+
+async function speedPreview() {
+  $("speedMessage").innerHTML = "";
+  const body = speedParams();
+  if (!body) return;
+  let res;
+  try {
+    res = await fetch("/api/speed/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+  } catch (e) { return showSpeedError("网络错误：" + e); }
+  const data = await res.json();
+  if (!res.ok) return showSpeedError(speedErrDetail(data));
+  if (!data.feasible) {
+    $("speedResult").innerHTML = "";
+    $("speedMessage").innerHTML = `<div class="bad-banner">✗ 无法修复：${escapeHtml(data.reason)}</div>`;
+    $("speedExportBtn").disabled = true;
+    return;
+  }
+  renderSpeedPreview(data);
+}
+
+async function speedExport() {
+  const body = speedParams();
+  if (!body) return;
+  let res;
+  try {
+    res = await fetch("/api/speed/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+  } catch (e) { return showSpeedError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showSpeedError(speedErrDetail(data) || "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "speed_fixed.srt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ SRT 修订差异对照
+
+bindTrackFile("diffOldFile", "diffOld");
+bindTrackFile("diffNewFile", "diffNew");
+
+const DIFF_TYPE_CN = {
+  unchanged: "未变", changed: "改词", split: "拆分",
+  merge: "合并", delete: "删除", add: "新增",
+};
+
+function diffPayload() {
+  return JSON.stringify({ old_srt: $("diffOld").value, new_srt: $("diffNew").value });
+}
+
+function showDiffError(msg) {
+  $("diffMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("diffResult").innerHTML = "";
+  $("diffExportBtn").disabled = true;
+}
+
+function renderDiffSide(entries) {
+  if (!entries.length) return `<div class="diff-none">— 无 —</div>`;
+  return entries.map(e => `
+    <div class="diff-entry">
+      <div class="diff-meta">#${e.seq}（原序号 ${escapeHtml(e.index)}） · ${escapeHtml(e.time)}</div>
+      <div class="mono">${escapeHtml(e.text)}</div>
+    </div>`).join("");
+}
+
+function renderDiffPreview(pv) {
+  const rows = pv.groups.map(g => {
+    let meta = "";
+    if (g.similarity != null) {
+      meta = `<span class="diff-meta">相似度 ${g.similarity.toFixed(3)} · 时间差 ${g.gap_ms} ms</span>`;
+      if ((g.type === "split" || g.type === "merge") && g.text_changed) {
+        meta += `<span class="diff-changed-note">（正文同时有改动）</span>`;
+      }
+    }
+    return `
+    <tr class="diff-row-${g.type}">
+      <td>${g.seq}</td>
+      <td><span class="diff-type ${g.type}">${DIFF_TYPE_CN[g.type]}</span><br>${meta}</td>
+      <td class="diff-side">${renderDiffSide(g.old)}</td>
+      <td class="diff-side">${renderDiffSide(g.new)}</td>
+    </tr>`;
+  }).join("");
+  $("diffResult").innerHTML = `<table>
+    <tr><th style="width:3em">组</th><th style="width:9em">类型</th><th>旧版（原序号 / 时间 / 正文）</th><th>新版（原序号 / 时间 / 正文）</th></tr>
+    ${rows}</table>`;
+  const c = pv.counts;
+  const badge = t => `<span class="diff-type ${t}">${DIFF_TYPE_CN[t]} ${c[t]}</span>`;
+  const avg = pv.avg_similarity == null ? "—" : pv.avg_similarity.toFixed(3);
+  $("diffMessage").innerHTML =
+    `<div class="ok-banner">✓ 旧版 ${pv.old_count} 条 / 新版 ${pv.new_count} 条，` +
+    `对齐为 ${pv.group_count} 组；平均相似度 ${avg}。&nbsp; ` +
+    [badge("unchanged"), badge("changed"), badge("split"), badge("merge"),
+     badge("delete"), badge("add")].join(" ") + `</div>`;
+  $("diffExportBtn").disabled = false;
+}
+
+async function diffPreview() {
+  $("diffMessage").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/diff/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: diffPayload(),
+    });
+  } catch (e) { return showDiffError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderDiffPreview(data);
+  return showDiffError((typeof data.detail === "string") ? data.detail : "请求失败");
+}
+
+async function diffExport() {
+  let res;
+  try {
+    res = await fetch("/api/diff/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: diffPayload(),
+    });
+  } catch (e) { return showDiffError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showDiffError((typeof data.detail === "string") ? data.detail : "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "srt_diff.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+</script>
+</body>
+</html>
