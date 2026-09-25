@@ -244,6 +244,39 @@
   <div id="diffResult"></div>
 </div>
 
+<hr class="feature-divider">
+<h1 id="mark">字幕目标词时间标记</h1>
+<p class="hint">粘贴或上传 SRT，并<strong>逐行填写目标词</strong>（每行一个）。
+匹配时把各字幕正文的<strong>非空白字符按字幕原顺序连接</strong>成字符流，目标词同样<strong>去除空白</strong>后做<strong>大小写敏感的字面匹配</strong>；
+仅当<strong>相邻字幕间隔 ≤ 500ms</strong> 时才允许跨块命中。每个字符按所在字幕时长等分占用一个子区间，
+命中区间取<strong>首末字符所占子区间的外侧边界</strong>；可设置非负的<strong>前 / 后扩展毫秒</strong>，扩展后起点小于 0 时截为 0，
+<strong>重叠或相接</strong>的区间自动合并，可下载合并后的区间 CSV。字幕出现<strong>空时长、起止倒置或轨内重叠</strong>时会报错。</p>
+
+<div class="card">
+  <h2>12. 字幕内容、目标词与扩展毫秒</h2>
+  <input type="file" id="markFile" accept=".srt,.txt">
+  <textarea id="markSrt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;hello world&#10;&#10;2&#10;00:00:03,300 --> 00:00:05,300&#10;next line"></textarea>
+  <h3 style="font-size:14px;margin:10px 0 4px">目标词（每行一个，匹配前去空白）</h3>
+  <textarea id="markTargets" style="min-height:100px" placeholder="hello&#10;world"></textarea>
+  <div class="toolbar">
+    <span class="hint">前扩展 (ms)</span>
+    <input type="number" id="markPre" min="0" step="50" value="0" style="width:110px">
+    <span class="hint">后扩展 (ms)</span>
+    <input type="number" id="markPost" min="0" step="50" value="0" style="width:110px">
+  </div>
+</div>
+
+<div class="card">
+  <h2>13. 预览与下载合并区间 CSV</h2>
+  <div class="toolbar">
+    <button onclick="markPreview()">预览命中结果</button>
+    <button id="markExportBtn" onclick="markExport()" disabled>下载合并区间 CSV</button>
+    <span class="hint" id="markExportHint">请先预览，校验通过且有命中后才能下载</span>
+  </div>
+  <div id="markMessage"></div>
+  <div id="markResult"></div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 
@@ -809,6 +842,111 @@ async function diffExport() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "srt_diff.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 字幕目标词时间标记
+
+bindTrackFile("markFile", "markSrt");
+
+function markParams() {
+  const pre = Number($("markPre").value);
+  const post = Number($("markPost").value);
+  if (!Number.isInteger(pre) || pre < 0) { showMarkError("前扩展毫秒须为非负整数"); return null; }
+  if (!Number.isInteger(post) || post < 0) { showMarkError("后扩展毫秒须为非负整数"); return null; }
+  return {
+    srt: $("markSrt").value,
+    targets: $("markTargets").value,
+    pre_ms: pre,
+    post_ms: post,
+  };
+}
+
+function showMarkError(msg) {
+  $("markMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("markResult").innerHTML = "";
+  $("markExportBtn").disabled = true;
+}
+
+function markErrDetail(data) {
+  if (!data || data.detail == null) return "请求失败";
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return data.detail.map(d => d.msg || JSON.stringify(d)).join("；");
+  return data.detail.message || JSON.stringify(data.detail);
+}
+
+function renderMarkPreview(pv) {
+  const hitRows = pv.hits.map(h => `
+    <tr>
+      <td class="mono">${escapeHtml(h.word)}</td>
+      <td>${h.indices.map(ix => escapeHtml(ix)).join("、")}</td>
+      <td class="mono">${escapeHtml(h.start)} --&gt; ${escapeHtml(h.end)}</td>
+    </tr>`).join("");
+  const mergedRows = pv.merged.map(m => `
+    <tr>
+      <td>${m.seq}</td>
+      <td class="mono">${escapeHtml(m.start)}</td>
+      <td class="mono">${escapeHtml(m.end)}</td>
+      <td>${m.duration_ms}</td>
+      <td class="mono">${m.words.map(w => escapeHtml(w)).join("、")}</td>
+      <td>${m.indices.map(ix => escapeHtml(ix)).join("、")}</td>
+    </tr>`).join("");
+  $("markResult").innerHTML =
+    `<h3 style="font-size:14px;margin:8px 0">命中明细（${pv.hit_count} 处，区间为扩展后、合并前）</h3>` +
+    (pv.hit_count ? `<table>
+       <tr><th>命中词</th><th>原字幕序号</th><th>估算时间区间</th></tr>${hitRows}</table>`
+     : `<div class="hint">无命中。</div>`) +
+    `<h3 style="font-size:14px;margin:14px 0 8px">合并后区间（${pv.merged_count} 段，即 CSV 内容）</h3>` +
+    (pv.merged_count ? `<table>
+       <tr><th>#</th><th>开始</th><th>结束</th><th>时长(ms)</th><th>命中目标词</th><th>原字幕序号</th></tr>${mergedRows}</table>`
+     : `<div class="hint">无。</div>`);
+  if (pv.merged_count === 0) {
+    $("markMessage").innerHTML =
+      `<div class="bad-banner">✗ 共 ${pv.entry_count} 条字幕、${pv.target_count} 个目标词，` +
+      `没有命中任何目标词，无法下载。</div>`;
+    $("markExportBtn").disabled = true;
+  } else {
+    $("markMessage").innerHTML =
+      `<div class="ok-banner">✓ 共 ${pv.entry_count} 条字幕、${pv.target_count} 个目标词，` +
+      `命中 ${pv.hit_count} 处，合并为 ${pv.merged_count} 段区间` +
+      `（前扩展 ${pv.pre_ms} ms / 后扩展 ${pv.post_ms} ms），可以下载。</div>`;
+    $("markExportBtn").disabled = false;
+  }
+}
+
+async function markPreview() {
+  $("markMessage").innerHTML = "";
+  const body = markParams();
+  if (!body) return;
+  let res;
+  try {
+    res = await fetch("/api/mark/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+  } catch (e) { return showMarkError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderMarkPreview(data);
+  return showMarkError(markErrDetail(data));
+}
+
+async function markExport() {
+  const body = markParams();
+  if (!body) return;
+  let res;
+  try {
+    res = await fetch("/api/mark/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+  } catch (e) { return showMarkError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showMarkError(markErrDetail(data) || "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "word_marks.csv";
   a.click();
   URL.revokeObjectURL(a.href);
 }

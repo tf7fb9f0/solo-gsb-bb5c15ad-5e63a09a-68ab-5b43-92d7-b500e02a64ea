@@ -10,6 +10,7 @@ import io
 import math
 import re
 import unicodedata
+from fractions import Fraction
 from pathlib import Path
 from typing import List
 
@@ -17,7 +18,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -1578,4 +1579,242 @@ def diff_export(req: DiffRequest):
         content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="srt_diff.csv"'},
+    )
+
+
+# ---------------------------------------------------------------- 字幕目标词时间标记
+
+class MarkRequest(BaseModel):
+    srt: str
+    targets: str      # 逐行目标词（每行一个，匹配前去除全部空白字符）
+    pre_ms: int = 0   # 命中区间向前扩展毫秒（非负）
+    post_ms: int = 0  # 命中区间向后扩展毫秒（非负）
+
+
+MAX_MARK_HITS = 100_000  # 命中总数上限（防止退化输入产生超大结果）
+
+
+def _mark_params(req: "MarkRequest"):
+    """校验前后扩展毫秒（均须为非负整数），返回 (pre_ms, post_ms)。失败抛 ValueError。"""
+    if req.pre_ms < 0 or req.post_ms < 0:
+        raise ValueError("前扩展与后扩展毫秒均须为非负整数")
+    return req.pre_ms, req.post_ms
+
+
+def _parse_targets(raw: str) -> List[str]:
+    """逐行读取目标词：去除每行全部空白字符；空行忽略；按去空白后的结果去重（保序）。"""
+    seen, out = set(), []
+    for ln in (raw or "").split("\n"):
+        t = "".join(ch for ch in ln if not ch.isspace())
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    if not out:
+        raise ValueError("请至少填写 1 个目标词（每行一个，匹配前会去除空白字符）")
+    return out
+
+
+def _mark_char_stream(entries: List[dict]):
+    """把各字幕正文的非空白字符按原顺序连成字符流。
+
+    返回 [(字符, 条目下标, 段号, 子区间起点, 子区间终点)]，时间为 Fraction 毫秒。
+    每个字符按所在字幕时长等分：条目共 k 个非空白字符、时长 d 时，第 ci 个字符占
+    [start + d*ci/k, start + d*(ci+1)/k)。相邻字幕间隔 > 500ms 时段号递增，
+    跨段号的字符之间不允许跨块命中（复用阅读速度修复的 500ms 间隔常量语义）。
+    """
+    seg_of_entry = [0] * len(entries)
+    for i in range(1, len(entries)):
+        gap = entries[i]["start"] - entries[i - 1]["end"]
+        seg_of_entry[i] = seg_of_entry[i - 1] + (1 if gap > MAX_MERGE_GAP_MS else 0)
+
+    chars = []
+    for pos, e in enumerate(entries):
+        body = [ch for ln in e["lines"] for ch in ln if not ch.isspace()]
+        k = len(body)
+        if not k:
+            continue
+        base, dur = Fraction(e["start"]), Fraction(e["end"] - e["start"])
+        for ci, ch in enumerate(body):
+            chars.append((
+                ch, pos, seg_of_entry[pos],
+                base + dur * ci / k, base + dur * (ci + 1) / k,
+            ))
+    return chars
+
+
+def find_mark_hits(entries: List[dict], targets: List[str]):
+    """在字符流中逐段做大小写敏感的字面匹配，返回全部命中（含相互重叠的命中）。
+
+    每个命中为 {word, entry_positions, start_frac, end_frac}：命中区间取首末字符
+    各自所占子区间的外侧边界（首字符子区间起点 → 末字符子区间终点），分数精确表示。
+    """
+    chars = _mark_char_stream(entries)
+    segs = {}
+    for c in chars:
+        segs.setdefault(c[2], []).append(c)
+
+    hits = []
+    for seg_id in sorted(segs):
+        cl = segs[seg_id]
+        text = "".join(c[0] for c in cl)
+        for t in targets:
+            lt = len(t)
+            p = text.find(t)
+            while p >= 0:
+                hits.append({
+                    "word": t,
+                    "entry_positions": sorted({c[1] for c in cl[p:p + lt]}),
+                    "start_frac": cl[p][3],
+                    "end_frac": cl[p + lt - 1][4],
+                })
+                if len(hits) > MAX_MARK_HITS:
+                    raise ValueError(
+                        f"命中总数超过上限 {MAX_MARK_HITS}，请缩小目标词范围后重试"
+                    )
+                p = text.find(t, p + 1)  # 步进 1：保留相互重叠的命中
+    return hits
+
+
+def _round_half_up(x: Fraction) -> int:
+    """Fraction 毫秒四舍五入（半点向上）为整数；调用时数值均已非负。"""
+    return math.floor(x + Fraction(1, 2))
+
+
+def plan_mark(entries: List[dict], targets: List[str], pre_ms: int, post_ms: int):
+    """计算全部命中的最终区间（扩展、起点截 0、取整），并合并重叠/相接区间。
+
+    返回 (hits, merged)：
+      hits   按 (起点, 终点, 目标词) 排序，每项 {word, indices, start_ms, end_ms}；
+      merged 每项 {start_ms, end_ms, words, indices}，words/indices 按首次出现去重。
+    """
+    hits = []
+    for h in find_mark_hits(entries, targets):
+        s = h["start_frac"] - pre_ms
+        e = h["end_frac"] + post_ms
+        if s < 0:  # 扩展后起点截为 0
+            s = Fraction(0)
+        hits.append({
+            "word": h["word"],
+            "indices": [entries[p]["index"] for p in h["entry_positions"]],
+            "start_ms": _round_half_up(s),
+            "end_ms": _round_half_up(e),
+        })
+    hits.sort(key=lambda h: (h["start_ms"], h["end_ms"], h["word"]))
+
+    merged = []
+    for h in hits:
+        if merged and h["start_ms"] <= merged[-1]["end_ms"]:  # 重叠或相接即合并
+            m = merged[-1]
+            if h["end_ms"] > m["end_ms"]:
+                m["end_ms"] = h["end_ms"]
+            if h["word"] not in m["_wset"]:
+                m["_wset"].add(h["word"])
+                m["words"].append(h["word"])
+            for ix in h["indices"]:
+                if ix not in m["_iset"]:
+                    m["_iset"].add(ix)
+                    m["indices"].append(ix)
+        else:
+            merged.append({
+                "start_ms": h["start_ms"],
+                "end_ms": h["end_ms"],
+                "words": [h["word"]],
+                "indices": list(h["indices"]),
+                "_wset": {h["word"]},
+                "_iset": set(h["indices"]),
+            })
+    for m in merged:
+        del m["_wset"], m["_iset"]
+    return hits, merged
+
+
+def _mark_prepare(req: "MarkRequest"):
+    """目标词标记公共预处理：校验扩展参数与目标词、解析并校验轨道，失败抛 400。"""
+    try:
+        pre_ms, post_ms = _mark_params(req)
+        targets = _parse_targets(req.targets)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        entries = parse_srt(req.srt)
+        # 与阅读速度修复相同的轨道校验：空时长 / 起止倒置 / 轨内重叠均报错
+        _validate_speed_track(entries)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entries, targets, pre_ms, post_ms
+
+
+def _mark_hit_payload(h: dict) -> dict:
+    return {
+        "word": h["word"],
+        "indices": h["indices"],
+        "start": fmt_time(h["start_ms"]),
+        "end": fmt_time(h["end_ms"]),
+        "start_ms": h["start_ms"],
+        "end_ms": h["end_ms"],
+    }
+
+
+def _mark_merged_payload(hits, merged) -> List[dict]:
+    return [
+        {
+            "seq": seq,
+            "start": fmt_time(m["start_ms"]),
+            "end": fmt_time(m["end_ms"]),
+            "duration_ms": m["end_ms"] - m["start_ms"],
+            "words": m["words"],
+            "indices": m["indices"],
+        }
+        for seq, m in enumerate(merged, 1)
+    ]
+
+
+@app.post("/api/mark/preview")
+def mark_preview(req: MarkRequest):
+    entries, targets, pre_ms, post_ms = _mark_prepare(req)
+    try:
+        hits, merged = plan_mark(entries, targets, pre_ms, post_ms)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "entry_count": len(entries),
+        "target_count": len(targets),
+        "hit_count": len(hits),
+        "merged_count": len(merged),
+        "pre_ms": pre_ms,
+        "post_ms": post_ms,
+        "hits": [_mark_hit_payload(h) for h in hits],
+        "merged": _mark_merged_payload(hits, merged),
+    }
+
+
+_MARK_CSV_HEADER = ["序号", "开始时间", "结束时间", "时长(ms)", "命中目标词", "原字幕序号"]
+
+
+@app.post("/api/mark/export")
+def mark_export(req: MarkRequest):
+    entries, targets, pre_ms, post_ms = _mark_prepare(req)
+    try:
+        hits, merged = plan_mark(entries, targets, pre_ms, post_ms)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not merged:
+        raise HTTPException(status_code=400, detail="没有命中任何目标词，没有可导出的区间")
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")  # RFC 4180：CRLF、按需加引号
+    writer.writerow(_MARK_CSV_HEADER)
+    for seq, m in enumerate(merged, 1):
+        writer.writerow([
+            seq,
+            fmt_time(m["start_ms"]),
+            fmt_time(m["end_ms"]),
+            m["end_ms"] - m["start_ms"],
+            "、".join(m["words"]),
+            "、".join(m["indices"]),
+        ])
+    # UTF-8 BOM，确保 Excel 直接双击打开时中文不乱码
+    return Response(
+        content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="word_marks.csv"'},
     )
